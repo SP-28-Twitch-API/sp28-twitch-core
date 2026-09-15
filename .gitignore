@@ -141,3 +141,24 @@ dist
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .vite/
+
+
+# Security: API Keys, Credentials & Local Environments
+
+.env
+.env.local
+.env.*.local
+*.env
+
+# Python virtual environments & bytecode (if we decide to use Python)
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+env/
+
+# System & Build Artifacts
+dist/
+build/
+.DS_Store
+*.log
