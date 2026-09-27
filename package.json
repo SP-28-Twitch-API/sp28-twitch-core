@@ -1,0 +1,33 @@
+{
+  "name": "sp28-twitch-core",
+  "version": "1.0.0",
+  "description": "Real-time Twitch API and EventSub creator dashboard and OBS overlay suite.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "nodemon src/server.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SP-28-Twitch-API/sp28-twitch-core.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/SP-28-Twitch-API/sp28-twitch-core/issues"
+  },
+  "homepage": "https://github.com/SP-28-Twitch-API/sp28-twitch-core#readme",
+  "dependencies": {
+    "axios": "^1.20.0",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.6",
+    "dotenv": "^18.0.4",
+    "express": "^5.2.1",
+    "ws": "^8.22.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.14"
+  }
+}
