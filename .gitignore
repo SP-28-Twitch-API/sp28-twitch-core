@@ -166,3 +166,6 @@ node_modules/
 .env
 .env.local
 *.pem
+
+# encrypted local data store
+data/
