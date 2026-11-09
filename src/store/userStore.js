@@ -29,6 +29,7 @@ this.saveTimer = setTimeout(() => {
 this.saveTimer = null;
 this.flush();
 }, SAVE_DELAY_MS);
+this.saveTimer.unref();
 }
 
 // write immediately, used on shutdown

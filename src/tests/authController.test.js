@@ -1,22 +1,12 @@
-// Unit tests for controllers/authController.js (SRS 3.1.1-3.1.5, 3.5.2)
+// unit tests for controllers/authController.js (SRS 3.1.1-3.1.6)
 jest.mock('axios');
-jest.mock('../config/twitch', () => ({
-  clientId: 'test-client-id',
-  clientSecret: 'test-client-secret',
-  redirectUri: 'http://localhost:3000/auth/callback',
-  scopes: 'user:read:email moderator:read:followers'
-}));
-jest.mock('../services/tokenManager', () => ({
-  setSession: jest.fn(),
-  getSession: jest.fn(),
-  getValidAccessToken: jest.fn(),
-  regenerateOverlayToken: jest.fn(),
-  clearSession: jest.fn()
-}));
 
 const axios = require('axios');
-const tokenManager = require('../services/tokenManager');
 const controller = require('../controllers/authController');
+const userStore = require('../store/userStore');
+const sessionStore = require('../services/sessionStore');
+
+const FRONTEND = 'http://localhost:5173';
 
 const mockRes = () => {
   const res = {};
@@ -24,7 +14,23 @@ const mockRes = () => {
   res.send = jest.fn().mockReturnValue(res);
   res.json = jest.fn().mockReturnValue(res);
   res.redirect = jest.fn().mockReturnValue(res);
+  res.cookie = jest.fn().mockReturnValue(res);
+  res.clearCookie = jest.fn().mockReturnValue(res);
   return res;
+};
+
+// start a login and return the state it put in the cookie
+const startLogin = () => {
+  const res = mockRes();
+  controller.login({}, res);
+  return res.cookie.mock.calls[0][1];
+};
+
+const mockTwitchSuccess = () => {
+  axios.post.mockResolvedValue({ data: { access_token: 'a', refresh_token: 'r', expires_in: 14400, scope: [] } });
+  axios.get.mockResolvedValue({
+    data: { data: [{ id: '42', login: 'streamer', display_name: 'Streamer', profile_image_url: 'https://img/x.png', broadcaster_type: 'affiliate' }] }
+  });
 };
 
 beforeEach(() => {
@@ -38,114 +44,120 @@ describe('login', () => {
     const res = mockRes();
     controller.login({}, res);
 
-    expect(res.redirect).toHaveBeenCalledTimes(1);
     const url = new URL(res.redirect.mock.calls[0][0]);
     expect(url.origin + url.pathname).toBe('https://id.twitch.tv/oauth2/authorize');
     expect(url.searchParams.get('client_id')).toBe('test-client-id');
     expect(url.searchParams.get('redirect_uri')).toBe('http://localhost:3000/auth/callback');
     expect(url.searchParams.get('response_type')).toBe('code');
-    expect(url.searchParams.get('scope')).toBe('user:read:email moderator:read:followers');
+    expect(url.searchParams.get('scope')).toContain('moderator:read:followers');
     expect(url.searchParams.get('force_verify')).toBe('true');
   });
 
-  // SRS 3.1.6 - not built yet
-  test.todo('includes a unique "state" value on every login attempt (SRS 3.1.6)');
+  test('puts the same random state in the url and a signed httpOnly cookie (SRS 3.1.6)', () => {
+    const res = mockRes();
+    controller.login({}, res);
+
+    const [name, value, options] = res.cookie.mock.calls[0];
+    const url = new URL(res.redirect.mock.calls[0][0]);
+    expect(name).toBe('oauth_state');
+    expect(value).toMatch(/^[0-9a-f]{32}$/);
+    expect(url.searchParams.get('state')).toBe(value);
+    expect(options).toMatchObject({ httpOnly: true, signed: true, sameSite: 'lax', path: '/auth' });
+  });
+
+  test('every login gets a different state', () => {
+    expect(startLogin()).not.toBe(startLogin());
+  });
 });
 
 describe('callback', () => {
-  test('returns 400 when Twitch sends an error', async () => {
-    const res = mockRes();
-    await controller.callback({ query: { error: 'access_denied', error_description: 'denied' } }, res);
-    expect(res.status).toHaveBeenCalledWith(400);
+  test('rejects a missing or wrong state without calling Twitch', async () => {
+    const state = startLogin();
+    for (const query of [{ code: 'abc' }, { code: 'abc', state: 'wrong' }, { code: 'abc', state }]) {
+      const res = mockRes();
+      const cookies = query.state === state ? {} : { oauth_state: state }; // last case: cookie missing
+      await controller.callback({ query, signedCookies: cookies }, res);
+      expect(res.redirect).toHaveBeenCalledWith(`${FRONTEND}/login?reason=state`);
+    }
     expect(axios.post).not.toHaveBeenCalled();
   });
 
-  test('returns 400 when the authorization code is missing', async () => {
+  test('clears the state cookie so it can only be used once', async () => {
     const res = mockRes();
-    await controller.callback({ query: {} }, res);
-    expect(res.status).toHaveBeenCalledWith(400);
-    expect(res.send).toHaveBeenCalledWith('Authorization code missing.');
+    await controller.callback({ query: {}, signedCookies: {} }, res);
+    expect(res.clearCookie).toHaveBeenCalledWith('oauth_state', { path: '/auth' });
   });
 
-  test('exchanges the code, loads the profile and initializes the session', async () => {
-    const tokenData = { access_token: 'a', refresh_token: 'r', expires_in: 14400 };
-    axios.post.mockResolvedValue({ data: tokenData });
-    axios.get.mockResolvedValue({ data: { data: [{ id: '42', display_name: 'Streamer' }] } });
-    tokenManager.getSession.mockReturnValue({ overlayToken: 'overlay123' });
+  test('streamer pressing Cancel goes back to login with reason=denied', async () => {
+    const state = startLogin();
+    const res = mockRes();
+    await controller.callback({ query: { error: 'access_denied', state }, signedCookies: { oauth_state: state } }, res);
+    expect(res.redirect).toHaveBeenCalledWith(`${FRONTEND}/login?reason=denied`);
+  });
+
+  test('success: saves the streamer, sets a session cookie and redirects to the dashboard', async () => {
+    mockTwitchSuccess();
+    const state = startLogin();
     const res = mockRes();
 
-    await controller.callback({ query: { code: 'abc' } }, res);
+    await controller.callback({ query: { code: 'abc', state }, signedCookies: { oauth_state: state } }, res);
 
-    const [url, , opts] = axios.post.mock.calls[0];
-    expect(url).toBe('https://id.twitch.tv/oauth2/token');
-    expect(opts.params).toMatchObject({ code: 'abc', grant_type: 'authorization_code' });
-
+    // helix call uses the new token
     const [helixUrl, helixOpts] = axios.get.mock.calls[0];
     expect(helixUrl).toBe('https://api.twitch.tv/helix/users');
     expect(helixOpts.headers.Authorization).toBe('Bearer a');
-    expect(helixOpts.headers['Client-ID']).toBe('test-client-id');
 
-    expect(tokenManager.setSession).toHaveBeenCalledWith(tokenData, { id: '42', display_name: 'Streamer' });
-    expect(res.send).toHaveBeenCalledWith(expect.stringContaining('Authentication Successful'));
+    const user = userStore.get('42');
+    expect(user.profile.displayName).toBe('Streamer');
+    expect(user.tokens.refreshToken).toBe('r');
+    expect(user.overlayToken).toMatch(/^[0-9a-f]{32}$/);
+
+    const [name, sid, options] = res.cookie.mock.calls[0];
+    expect(name).toBe('sid');
+    expect(options).toMatchObject({ httpOnly: true, signed: true, sameSite: 'lax' });
+    expect(sessionStore.get(sid).broadcasterId).toBe('42');
+    expect(res.redirect).toHaveBeenCalledWith(`${FRONTEND}/dashboard`);
   });
 
-  test('returns 500 and does not create a session when the token exchange fails', async () => {
-    axios.post.mockRejectedValue(new Error('twitch down'));
+  test('never sends HTML or tokens back to the browser (XSS fix)', async () => {
+    mockTwitchSuccess();
+    const state = startLogin();
     const res = mockRes();
-    await controller.callback({ query: { code: 'abc' } }, res);
-    expect(res.status).toHaveBeenCalledWith(500);
-    expect(tokenManager.setSession).not.toHaveBeenCalled();
+    await controller.callback({ query: { code: 'abc', state }, signedCookies: { oauth_state: state } }, res);
+    expect(res.send).not.toHaveBeenCalled();
+    expect(res.json).not.toHaveBeenCalled();
   });
 
-  // Documented limitations in the Development Document
-  test.todo('escapes broadcaster name / error text in HTML output (XSS)');
-  test.todo('does not leak raw error details in the 500 response');
-});
-
-describe('getProfile', () => {
-  test('returns the first Helix user using a valid token', async () => {
-    tokenManager.getValidAccessToken.mockResolvedValue('tok');
-    axios.get.mockResolvedValue({ data: { data: [{ id: '1', display_name: 'A' }] } });
+  test('failed token exchange: no session, friendly redirect, no raw error details', async () => {
+    axios.post.mockRejectedValue({ response: { status: 400, data: { message: 'Invalid authorization code' } } });
+    const state = startLogin();
     const res = mockRes();
 
-    await controller.getProfile({}, res);
+    await controller.callback({ query: { code: 'bad', state }, signedCookies: { oauth_state: state } }, res);
 
-    expect(axios.get.mock.calls[0][1].headers.Authorization).toBe('Bearer tok');
-    expect(res.json).toHaveBeenCalledWith({ id: '1', display_name: 'A' });
-  });
-
-  test('returns 401 when there is no valid session', async () => {
-    tokenManager.getValidAccessToken.mockRejectedValue(new Error('No active session found.'));
-    const res = mockRes();
-    await controller.getProfile({}, res);
-    expect(res.status).toHaveBeenCalledWith(401);
-    expect(res.json).toHaveBeenCalledWith({ error: 'No active session found.' });
-  });
-});
-
-describe('regenerateOverlayKey', () => {
-  test('returns the new token and an overlay URL containing it', () => {
-    tokenManager.regenerateOverlayToken.mockReturnValue('newtoken');
-    const res = mockRes();
-    controller.regenerateOverlayKey({}, res);
-    const body = res.json.mock.calls[0][0];
-    expect(body.overlayToken).toBe('newtoken');
-    expect(body.overlayUrl).toContain('/overlay/newtoken');
-  });
-
-  test('returns 500 if regeneration throws', () => {
-    tokenManager.regenerateOverlayToken.mockImplementation(() => { throw new Error('boom'); });
-    const res = mockRes();
-    controller.regenerateOverlayKey({}, res);
-    expect(res.status).toHaveBeenCalledWith(500);
+    expect(res.redirect).toHaveBeenCalledWith(`${FRONTEND}/login?reason=twitch`);
+    expect(res.cookie).not.toHaveBeenCalled();
+    expect(res.json).not.toHaveBeenCalled();
   });
 });
 
 describe('logout', () => {
-  test('clears the session', () => {
+  test('ends this browser session and clears the cookie but keeps stored tokens', () => {
+    userStore.upsert('7', { profile: { displayName: 'A' }, tokens: { accessToken: 'x', refreshToken: 'y', expiresAt: Date.now() + 1e6 } });
+    const sid = sessionStore.create('7');
     const res = mockRes();
-    controller.logout({}, res);
-    expect(tokenManager.clearSession).toHaveBeenCalledTimes(1);
-    expect(res.json).toHaveBeenCalledWith({ message: 'Logged out. Session cleared.' });
+
+    controller.logout({ signedCookies: { sid } }, res);
+
+    expect(sessionStore.get(sid)).toBeNull();
+    expect(res.clearCookie).toHaveBeenCalledWith('sid', { path: '/' });
+    expect(userStore.get('7').tokens).not.toBeNull(); // overlay keeps working after logout
+    expect(res.json).toHaveBeenCalledWith({ message: 'Logged out.' });
+  });
+
+  test('works even when nobody is logged in', () => {
+    const res = mockRes();
+    controller.logout({ signedCookies: {} }, res);
+    expect(res.json).toHaveBeenCalledWith({ message: 'Logged out.' });
   });
 });

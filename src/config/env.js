@@ -39,5 +39,9 @@ module.exports = {
   dataKey: Buffer.from(process.env.DATA_KEY, 'hex'),
   dataFile: process.env.DATA_FILE || 'data/store.enc',
   frontendUrl: process.env.FRONTEND_URL || 'http://localhost:5173',
-  publicBaseUrl: process.env.PUBLIC_BASE_URL || `http://localhost:${port}`
+  publicBaseUrl: process.env.PUBLIC_BASE_URL || `http://localhost:${port}`,
+  publicBaseUrl: process.env.PUBLIC_BASE_URL || `http://localhost:${port}`,
+  // requests per minute per ip (srs 4.1), tests raise these so they never get blocked
+  authRateLimit: Number(process.env.AUTH_RATE_LIMIT) || 10,
+  apiRateLimit: Number(process.env.API_RATE_LIMIT) || 120
 };
