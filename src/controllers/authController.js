@@ -1,102 +1,81 @@
-const axios = require('axios');
+const crypto = require('crypto');
+const env = require('../config/env');
 const twitchConfig = require('../config/twitch');
 const tokenManager = require('../services/tokenManager');
+const twitchApi = require('../services/twitchApi');
+const sessionStore = require('../services/sessionStore');
+const userStore = require('../store/userStore');
+const { SESSION_COOKIE, sessionCookieOptions } = require('../middleware/session');
 
-// redirect streamer to Twitch consent screen
+const STATE_COOKIE = 'oauth_state';
+const STATE_TTL_MS = 10 * 60 * 1000; // a login has 10 minutes to come back from twitch
+
+const stateCookieOptions = () => ({
+  httpOnly: true,
+  sameSite: 'lax', // lax b/c strict would drop it on the redirect back from twitch
+  secure: env.isProd,
+  signed: true,
+  path: '/auth',
+  maxAge: STATE_TTL_MS
+});
+
+// reason is state, denied, twitch (the login page turns it into a message)
+const redirectToLogin = (res, reason) =>
+  res.redirect(`${env.frontendUrl}/login?reason=${encodeURIComponent(reason)}`);
+
+// constant-time compare so the check doesn't leak anything through timing
+const sameState = (a, b) =>
+  typeof a === 'string' && typeof b === 'string' && a.length === b.length &&
+  crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
+
+// redirect streamer to the twitch consent screen with a fresh state value (srs 3.1.6)
 exports.login = (req, res) => {
-const params = new URLSearchParams({
-client_id: twitchConfig.clientId,
-redirect_uri: twitchConfig.redirectUri,
-response_type: 'code',
-scope: twitchConfig.scopes,
-force_verify: 'true'
-});
-res.redirect(`https://id.twitch.tv/oauth2/authorize?${params.toString()}`);
+  const state = crypto.randomBytes(16).toString('hex');
+  res.cookie(STATE_COOKIE, state, stateCookieOptions());
+
+  const params = new URLSearchParams({
+    client_id: twitchConfig.clientId,
+    redirect_uri: twitchConfig.redirectUri,
+    response_type: 'code',
+    scope: twitchConfig.scopes,
+    state,
+    force_verify: 'true'
+  });
+  res.redirect(`https://id.twitch.tv/oauth2/authorize?${params.toString()}`);
 };
 
-// exchange auth code for user access token and refresh token
+// twitch sends the streamer back here with "?code=...&state=..."
 exports.callback = async (req, res) => {
-const { code, error, error_description } = req.query;
+  const { code, state, error } = req.query;
+  const expectedState = req.signedCookies && req.signedCookies[STATE_COOKIE];
+  res.clearCookie(STATE_COOKIE, { path: '/auth' }); // each state works once
 
-if (error) {
-return res.status(400).send(`OAuth Error: ${error_description}`);
-}
-if (!code) {
-return res.status(400).send('Authorization code missing.');
-}
+  if (!sameState(state, expectedState)) return redirectToLogin(res, 'state');
+  if (error) return redirectToLogin(res, error === 'access_denied' ? 'denied' : 'twitch');
+  if (!code) return redirectToLogin(res, 'twitch');
 
-try {
-// hit Twitch token endpoint
-const tokenResponse = await axios.post('https://id.twitch.tv/oauth2/token', null, {
-params: {
-client_id: twitchConfig.clientId,
-client_secret: twitchConfig.clientSecret,
-code,
-grant_type: 'authorization_code',
-redirect_uri: twitchConfig.redirectUri
-}
-});
+  try {
+    const tokens = await tokenManager.exchangeCode(code);
+    const { id, ...profile } = await twitchApi.getUser(tokens.accessToken);
+    userStore.upsert(id, { profile, tokens });
 
-const tokenData = tokenResponse.data;
+    // replace any older login in this browser
+    const oldSid = req.signedCookies && req.signedCookies[SESSION_COOKIE];
+    if (oldSid) sessionStore.destroy(oldSid);
 
-// get broadcaaster profile right after getting token
-const userResponse = await axios.get('https://api.twitch.tv/helix/users', {
-headers: {
-'Client-ID': twitchConfig.clientId,
-'Authorization': `Bearer ${tokenData.access_token}`
-}
-});
-
-const broadcaster = userResponse.data.data[0];
-tokenManager.setSession(tokenData, broadcaster);
-
-// temporary confirmation page
-res.send(`
-<div style="font-family: Arial, sans-serif; padding: 2.5rem; text-align: center;">
-<h2 style="color: #6441a5;">Authentication Successful!</h2>
-<p>Broadcaster: <strong>${broadcaster.display_name}</strong> (ID: ${broadcaster.id})</p>
-<p>Active Overlay Token: <code>${tokenManager.getSession().overlayToken}</code></p>
-<p>Backend session is now initialized.</p>
-</div>
-`);
-} catch (err) {
-console.error('[Auth Callback] Error:', err.response?.data || err.message);
-res.status(500).json({ error: 'OAuth handshake failed', details: err.response?.data || err.message });
-}
+    res.cookie(SESSION_COOKIE, sessionStore.create(id), sessionCookieOptions());
+    res.redirect(`${env.frontendUrl}/dashboard`);
+  } catch (err) {
+    // details stay in the server log, the streamer just sees message
+    console.error('[Auth] Login failed:', (err.response && err.response.data) || err.message);
+    redirectToLogin(res, 'twitch');
+  }
 };
 
-// get current user info using active token
-exports.getProfile = async (req, res) => {
-try {
-const token = await tokenManager.getValidAccessToken();
-const response = await axios.get('https://api.twitch.tv/helix/users', {
-headers: {
-'Client-ID': twitchConfig.clientId,
-'Authorization': `Bearer ${token}`
-}
-});
-res.json(response.data.data[0]);
-} catch (err) {
-res.status(401).json({ error: err.message });
-}
-};
-
-// generate new key if streamer accidentally shows url on stream
-exports.regenerateOverlayKey = (req, res) => {
-try {
-const newToken = tokenManager.regenerateOverlayToken();
-res.json({
-message: 'Overlay token regenerated.',
-overlayToken: newToken,
-overlayUrl: `http://localhost:${process.env.PORT || 3000}/overlay/${newToken}?theme=dark`
-});
-} catch (err) {
-res.status(500).json({ error: err.message });
-}
-};
-
-// clear session data
+// ends this browser's login, tokens stay saved so the overlay keeps working (srs 3.1.5)
 exports.logout = (req, res) => {
-tokenManager.clearSession();
-res.json({ message: 'Logged out. Session cleared.' });
+  const sid = req.signedCookies && req.signedCookies[SESSION_COOKIE];
+  if (sid) sessionStore.destroy(sid);
+  res.clearCookie(SESSION_COOKIE, { path: '/' });
+  res.json({ message: 'Logged out.' });
 };

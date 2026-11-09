@@ -1,185 +1,164 @@
-// Unit tests for services/tokenManager.js (SRS 3.1.4, SDD 5.1)
+// unit tests for services/tokenManager.js (SRS 3.1.3, 3.1.4, 3.1.7, SDD 5.1)
 jest.mock('axios');
-jest.mock('../config/twitch', () => ({
-  clientId: 'test-client-id',
-  clientSecret: 'test-client-secret',
-  redirectUri: 'http://localhost:3000/auth/callback',
-  scopes: 'user:read:email'
-}));
+
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 
 let axios;
 let tokenManager;
+let userStore;
+let sessionStore;
 
-const tokenData = (overrides = {}) => ({
-  access_token: 'access-1',
-  refresh_token: 'refresh-1',
-  expires_in: 14400, // ~4 hours, like Twitch
-  ...overrides
+const TOKEN_URL = 'https://id.twitch.tv/oauth2/token';
+const HOUR = 60 * 60 * 1000;
+
+// twitch-style token response
+const twitchTokens = (overrides = {}) => ({
+  data: { access_token: 'access-new', refresh_token: 'refresh-new', expires_in: 14400, scope: ['user:read:email'], ...overrides }
 });
 
+// a stored streamer whose access token expires in `msLeft`
+const addUser = (id, msLeft) =>
+  userStore.upsert(id, {
+    profile: { displayName: `Streamer${id}` },
+    tokens: { accessToken: `access-${id}`, refreshToken: `refresh-${id}`, expiresAt: Date.now() + msLeft, scopes: [] }
+  });
+
+const formBody = (call) => Object.fromEntries(call[1]); // URLSearchParams -> plain object
+
 beforeEach(() => {
-  jest.resetModules();            // fresh singleton for every test
+  jest.resetModules(); // fresh store, sessions and token manager for every test
+  process.env.DATA_FILE = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'sp28-tm-')), 'store.enc');
   jest.spyOn(console, 'log').mockImplementation(() => {});
   jest.spyOn(console, 'error').mockImplementation(() => {});
   axios = require('axios');
+  userStore = require('../store/userStore');
+  sessionStore = require('../services/sessionStore');
   tokenManager = require('../services/tokenManager');
 });
 
 afterEach(() => jest.restoreAllMocks());
 
-describe('setSession', () => {
-  test('stores tokens, broadcaster info and an absolute expiry time', () => {
-    const before = Date.now();
-    tokenManager.setSession(tokenData(), { id: '123', display_name: 'Streamer' });
-    const s = tokenManager.getSession();
+describe('exchangeCode', () => {
+  test('sends the code and secret in the form body, not the url', async () => {
+    axios.post.mockResolvedValue(twitchTokens());
+    const tokens = await tokenManager.exchangeCode('abc');
 
-    expect(s.accessToken).toBe('access-1');
-    expect(s.refreshToken).toBe('refresh-1');
-    expect(s.broadcasterId).toBe('123');
-    expect(s.displayName).toBe('Streamer');
-    expect(s.expiresAt).toBeGreaterThanOrEqual(before + 14400 * 1000);
-    expect(s.expiresAt).toBeLessThanOrEqual(Date.now() + 14400 * 1000);
-  });
-
-  test('creates a 32-char hex overlay token on first login', () => {
-    tokenManager.setSession(tokenData(), { id: '1', display_name: 'A' });
-    expect(tokenManager.getSession().overlayToken).toMatch(/^[0-9a-f]{32}$/);
-  });
-
-  test('keeps the existing overlay token when logging in again', () => {
-    tokenManager.setSession(tokenData(), { id: '1', display_name: 'A' });
-    const first = tokenManager.getSession().overlayToken;
-    tokenManager.setSession(tokenData({ access_token: 'access-2' }), { id: '1', display_name: 'A' });
-    expect(tokenManager.getSession().overlayToken).toBe(first);
-  });
-
-  test('works without broadcaster data (leaves old profile untouched)', () => {
-    tokenManager.setSession(tokenData());
-    expect(tokenManager.getSession().broadcasterId).toBeNull();
-  });
-});
-
-describe('regenerateOverlayToken', () => {
-  test('returns a new 32-char hex token and stores it', () => {
-    tokenManager.setSession(tokenData(), { id: '1', display_name: 'A' });
-    const old = tokenManager.getSession().overlayToken;
-    const fresh = tokenManager.regenerateOverlayToken();
-
-    expect(fresh).toMatch(/^[0-9a-f]{32}$/);
-    expect(fresh).not.toBe(old);
-    expect(tokenManager.getSession().overlayToken).toBe(fresh);
-  });
-
-  test('tokens are unique across many generations', () => {
-    const set = new Set();
-    for (let i = 0; i < 200; i++) set.add(tokenManager.regenerateOverlayToken());
-    expect(set.size).toBe(200);
+    const call = axios.post.mock.calls[0];
+    expect(call[0]).toBe(TOKEN_URL); // no query string with the secret
+    expect(call[1]).toBeInstanceOf(URLSearchParams);
+    expect(formBody(call)).toMatchObject({
+      code: 'abc',
+      grant_type: 'authorization_code',
+      client_id: 'test-client-id',
+      client_secret: 'test-client-secret',
+      redirect_uri: 'http://localhost:3000/auth/callback'
+    });
+    expect(tokens.accessToken).toBe('access-new');
+    expect(tokens.refreshToken).toBe('refresh-new');
+    expect(tokens.expiresAt).toBeGreaterThan(Date.now() + 14000 * 1000);
+    expect(tokens.scopes).toEqual(['user:read:email']);
   });
 });
 
 describe('getValidAccessToken', () => {
-  test('throws a clear error when nobody is logged in', async () => {
-    await expect(tokenManager.getValidAccessToken()).rejects.toThrow(/No active session/);
+  test('throws REAUTH_REQUIRED for an unknown streamer', async () => {
+    await expect(tokenManager.getValidAccessToken('nobody')).rejects.toMatchObject({ code: 'REAUTH_REQUIRED' });
   });
 
-  test('returns the current token when more than 5 minutes remain', async () => {
-    tokenManager.setSession(tokenData(), { id: '1', display_name: 'A' });
-    await expect(tokenManager.getValidAccessToken()).resolves.toBe('access-1');
+  test('returns the stored token when more than 5 minutes remain', async () => {
+    addUser('1', HOUR);
+    await expect(tokenManager.getValidAccessToken('1')).resolves.toBe('access-1');
     expect(axios.post).not.toHaveBeenCalled();
   });
 
   test('refreshes first when less than 5 minutes remain', async () => {
-    tokenManager.setSession(tokenData({ expires_in: 120 }), { id: '1', display_name: 'A' });
-    axios.post.mockResolvedValue({
-      data: { access_token: 'access-new', refresh_token: 'refresh-new', expires_in: 14400 }
-    });
+    addUser('1', 2 * 60 * 1000);
+    axios.post.mockResolvedValue(twitchTokens());
 
-    const token = await tokenManager.getValidAccessToken();
-
-    expect(token).toBe('access-new');
-    expect(axios.post).toHaveBeenCalledTimes(1);
-    const [url, , options] = axios.post.mock.calls[0];
-    expect(url).toBe('https://id.twitch.tv/oauth2/token');
-    expect(options.params).toMatchObject({
+    await expect(tokenManager.getValidAccessToken('1')).resolves.toBe('access-new');
+    expect(formBody(axios.post.mock.calls[0])).toMatchObject({
       grant_type: 'refresh_token',
       refresh_token: 'refresh-1',
-      client_id: 'test-client-id',
       client_secret: 'test-client-secret'
     });
   });
 
   test('refreshes when the token is already expired', async () => {
-    tokenManager.setSession(tokenData({ expires_in: -10 }), { id: '1', display_name: 'A' });
-    axios.post.mockResolvedValue({
-      data: { access_token: 'a2', refresh_token: 'r2', expires_in: 14400 }
-    });
-    await expect(tokenManager.getValidAccessToken()).resolves.toBe('a2');
+    addUser('1', -1000);
+    axios.post.mockResolvedValue(twitchTokens({ access_token: 'a2' }));
+    await expect(tokenManager.getValidAccessToken('1')).resolves.toBe('a2');
   });
 });
 
 describe('refreshAccessToken', () => {
-  beforeEach(() => {
-    tokenManager.setSession(tokenData({ expires_in: 60 }), { id: '1', display_name: 'A' });
+  test('saves BOTH new tokens and the new expiry in the store', async () => {
+    addUser('1', 60 * 1000);
+    axios.post.mockResolvedValue(twitchTokens({ access_token: 'a2', refresh_token: 'r2' }));
+
+    await tokenManager.refreshAccessToken('1');
+    const { tokens } = userStore.get('1');
+    expect(tokens.accessToken).toBe('a2');
+    expect(tokens.refreshToken).toBe('r2');
+    expect(tokens.expiresAt).toBeGreaterThan(Date.now() + 14000 * 1000);
   });
 
-  test('replaces BOTH access and refresh tokens and the expiry', async () => {
-    axios.post.mockResolvedValue({
-      data: { access_token: 'a2', refresh_token: 'r2', expires_in: 14400 }
-    });
-    await tokenManager.refreshAccessToken();
-    const s = tokenManager.getSession();
-    expect(s.accessToken).toBe('a2');
-    expect(s.refreshToken).toBe('r2');
-    expect(s.expiresAt).toBeGreaterThan(Date.now() + 14000 * 1000);
-  });
-
-  test('concurrent callers share a single refresh request (mutex)', async () => {
+  test('concurrent callers for one streamer share a single request (mutex)', async () => {
+    addUser('1', 60 * 1000);
     let resolvePost;
-    axios.post.mockReturnValue(new Promise(r => { resolvePost = r; }));
+    axios.post.mockReturnValue(new Promise((r) => { resolvePost = r; }));
 
     const calls = [
-      tokenManager.refreshAccessToken(),
-      tokenManager.refreshAccessToken(),
-      tokenManager.getValidAccessToken()
+      tokenManager.refreshAccessToken('1'),
+      tokenManager.refreshAccessToken('1'),
+      tokenManager.getValidAccessToken('1')
     ];
-    resolvePost({ data: { access_token: 'a2', refresh_token: 'r2', expires_in: 14400 } });
-    const results = await Promise.all(calls);
+    resolvePost(twitchTokens({ access_token: 'a2' }));
 
+    await expect(Promise.all(calls)).resolves.toEqual(['a2', 'a2', 'a2']);
     expect(axios.post).toHaveBeenCalledTimes(1);
-    expect(results).toEqual(['a2', 'a2', 'a2']);
   });
 
-  test('throws a re-authentication error when Twitch rejects the refresh', async () => {
-    axios.post.mockRejectedValue({ response: { data: { message: 'Invalid refresh token' } } });
-    await expect(tokenManager.refreshAccessToken()).rejects.toThrow(/Re-authentication required/);
+  test('different streamers refresh independently', async () => {
+    addUser('1', 60 * 1000);
+    addUser('2', 60 * 1000);
+    axios.post.mockResolvedValue(twitchTokens());
+
+    await Promise.all([tokenManager.refreshAccessToken('1'), tokenManager.refreshAccessToken('2')]);
+    expect(axios.post).toHaveBeenCalledTimes(2);
   });
 
-  test('releases the lock after a failure so a later refresh can run', async () => {
-    axios.post.mockRejectedValueOnce(new Error('network'));
-    await expect(tokenManager.refreshAccessToken()).rejects.toThrow();
-    expect(tokenManager.isRefreshing).toBe(false);
+  test('rejected refresh ends the session everywhere (SRS 3.1.7)', async () => {
+    addUser('1', 60 * 1000);
+    const sidA = sessionStore.create('1');
+    const sidB = sessionStore.create('1');
+    const overlayBefore = userStore.get('1').overlayToken;
+    axios.post.mockRejectedValue({ response: { status: 400, data: { message: 'Invalid refresh token' } } });
 
-    axios.post.mockResolvedValueOnce({
-      data: { access_token: 'a3', refresh_token: 'r3', expires_in: 14400 }
-    });
-    await expect(tokenManager.refreshAccessToken()).resolves.toBe('a3');
+    await expect(tokenManager.refreshAccessToken('1')).rejects.toMatchObject({ code: 'REAUTH_REQUIRED', status: 401 });
+    expect(userStore.get('1').tokens).toBeNull();
+    expect(sessionStore.get(sidA)).toBeNull();
+    expect(sessionStore.get(sidB)).toBeNull();
+    expect(userStore.get('1').overlayToken).toBe(overlayBefore); // obs url survives a re-login
   });
 
-  // SRS 3.1.7 - currently only PARTIAL in the build (error raised, session not cleared)
-  test.todo('clears the session when a refresh is rejected (SRS 3.1.7)');
-});
+  test('network failure keeps the tokens and releases the lock', async () => {
+    addUser('1', 60 * 1000);
+    axios.post.mockRejectedValueOnce(new Error('ECONNRESET'));
 
-describe('clearSession', () => {
-  test('wipes every field', () => {
-    tokenManager.setSession(tokenData(), { id: '1', display_name: 'A' });
-    tokenManager.clearSession();
-    const s = tokenManager.getSession();
-    Object.values(s).forEach(v => expect(v).toBeNull());
+    await expect(tokenManager.refreshAccessToken('1')).rejects.toMatchObject({ code: 'TWITCH_UNAVAILABLE' });
+    expect(userStore.get('1').tokens.refreshToken).toBe('refresh-1');
+    expect(tokenManager.refreshing.size).toBe(0);
+
+    axios.post.mockResolvedValueOnce(twitchTokens({ access_token: 'a3' }));
+    await expect(tokenManager.refreshAccessToken('1')).resolves.toBe('a3');
   });
 
-  test('getValidAccessToken fails after logout', async () => {
-    tokenManager.setSession(tokenData(), { id: '1', display_name: 'A' });
-    tokenManager.clearSession();
-    await expect(tokenManager.getValidAccessToken()).rejects.toThrow(/No active session/);
+  test('error messages are plain language, not raw twitch errors (SRS 4.3)', async () => {
+    addUser('1', 60 * 1000);
+    axios.post.mockRejectedValue({ response: { status: 400, data: { message: 'Invalid refresh token' } } });
+    const err = await tokenManager.refreshAccessToken('1').catch((e) => e);
+    expect(err.message).toBe('Your Twitch session ended or access was removed. Please log in again.');
   });
 });
