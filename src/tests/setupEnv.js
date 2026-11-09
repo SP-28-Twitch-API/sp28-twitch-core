@@ -12,3 +12,6 @@ process.env.DATA_KEY = crypto.randomBytes(32).toString('hex');
 process.env.DATA_FILE = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'sp28-jest-')), 'store.enc');
 process.env.FRONTEND_URL = 'http://localhost:5173';
 process.env.NODE_ENV = 'test';
+// high limits so normal tests never hit the rate limiter (security.test.js checks it with low ones)
+process.env.AUTH_RATE_LIMIT = '1000';
+process.env.API_RATE_LIMIT = '10000';

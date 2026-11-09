@@ -1,6 +1,8 @@
 const tokenManager = require('../services/tokenManager');
 const twitchApi = require('../services/twitchApi');
 const userStore = require('../store/userStore');
+const accountService = require('../services/accountService');
+const { SESSION_COOKIE } = require('../middleware/session');
 
 // only what the dashboard needs, never tokens
 const publicProfile = (user) => ({
@@ -35,4 +37,18 @@ exports.getOverlay = (req, res) => {
 // POST /api/overlay/regenerate: the old url stops working right away (srs 3.5.2, 3.5.4)
 exports.regenerateOverlay = (req, res) => {
   res.json({ overlayToken: userStore.regenerateOverlayToken(req.user.broadcasterId) });
+};
+
+// POST /api/account/disconnect (srs 3.5.1, 3.5.5)
+exports.disconnect = async (req, res) => {
+  await accountService.disconnect(req.user.broadcasterId);
+  res.clearCookie(SESSION_COOKIE, { path: '/' });
+  res.json({ message: 'Your Twitch account was disconnected.' });
+};
+
+// DELETE /api/account (srs 3.5.6)
+exports.deleteAccount = async (req, res) => {
+  await accountService.deleteAccount(req.user.broadcasterId);
+  res.clearCookie(SESSION_COOKIE, { path: '/' });
+  res.json({ message: 'All your StreamPulse data was deleted.' });
 };

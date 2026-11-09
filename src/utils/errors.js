@@ -4,6 +4,7 @@ const ERRORS = {
   REAUTH_REQUIRED: { status: 401, message: 'Your Twitch session ended or access was removed. Please log in again.' },
   TWITCH_UNAVAILABLE: { status: 503, message: "Twitch isn't responding right now. Try again in a minute." },
   NOT_FOUND: { status: 404, message: "That API route doesn't exist." },
+  RATE_LIMITED: { status: 429, message: 'Too many attempts. Please wait a minute and try again.' },
   INTERNAL: { status: 500, message: 'Something went wrong on our side. Please try again.' }
 };
 

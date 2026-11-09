@@ -5,6 +5,7 @@ const sessionStore = require('./sessionStore');
 const { AppError } = require('../utils/errors');
 
 const TOKEN_URL = 'https://id.twitch.tv/oauth2/token';
+const REVOKE_URL = 'https://id.twitch.tv/oauth2/revoke';
 const REFRESH_MARGIN_MS = 5 * 60 * 1000; // refresh when under 5 minutes remain (sdd 5.1)
 
 // twitch's token response --> what we save in the store
@@ -83,7 +84,31 @@ class TokenManager {
       throw new AppError('TWITCH_UNAVAILABLE', (err.response && err.response.data) || err.message);
     }
   }
+// wait for a refresh that's already running, so it can't save new tokens after a disconnect
+  async waitForRefresh(broadcasterId) {
+    const running = this.refreshing.get(String(broadcasterId));
+    if (running) await running.catch(() => {});
+  }
 
+  // tell twitch to cancel this streamer's tokens (srs 3.5.5)
+  // best effort: a token that's already dead makes twitch answer 400, that's fine
+  async revokeTokens(broadcasterId) {
+    const user = userStore.get(broadcasterId);
+    const tokens = user && user.tokens;
+    if (!tokens) return 0;
+
+    const toRevoke = [tokens.accessToken, tokens.refreshToken].filter(Boolean);
+    const results = await Promise.allSettled(toRevoke.map((token) =>
+      axios.post(REVOKE_URL, new URLSearchParams({ client_id: twitchConfig.clientId, token }))
+    ));
+
+    const failed = results.filter((r) => r.status === 'rejected');
+    if (failed.length) {
+      const reason = failed[0].reason;
+      console.error(`[TokenManager] ${failed.length} token(s) not revoked:`, (reason.response && reason.response.data) || reason.message);
+    }
+    return toRevoke.length - failed.length;
+  }
   // wipe tokens and log the streamer out of every browser, settings and overlay url stay
   endSession(broadcasterId) {
     userStore.clearTokens(broadcasterId);

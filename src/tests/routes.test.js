@@ -132,6 +132,3 @@ test('/health still answers without logging in', async () => {
   expect(res.body.status).toBe('healthy');
 });
 
-// next step
-test.todo('POST /api/account/disconnect revokes tokens with Twitch (SRS 3.5.5)');
-test.todo('DELETE /api/account removes every stored record (SRS 3.5.6)');
